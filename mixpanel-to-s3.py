@@ -4,7 +4,12 @@ import logging
 import requests
 import re
 import datetime
+import json
+import gzip
+from io import BytesIO
 from boto3.s3.transfer import TransferConfig
+from dotenv import load_dotenv
+load_dotenv()
 
 '''
 Read parameters from Environment Variables. Don't forget to set these before running the script.
@@ -18,7 +23,7 @@ AWS_SECRET_ACCESS_KEY   = os.environ['AWS_SECRET_ACCESS_KEY'] # Need an IAM user
 S3_BUCKET               = os.environ['S3_BUCKET']
 S3_PATH                 = os.environ['S3_PATH'] # DO NOT use leading or trailing slash /
 MIXPANEL_API_SECRET     = os.environ['MIXPANEL_API_SECRET']
-DEFAULT_START_DATE      = (datetime.date.today() - datetime.timedelta(days=5)).isoformat() # Default: 5 days ago because Mixpanel events export may have a lag of 5 days behind.
+DEFAULT_START_DATE      = (datetime.date.today() - datetime.timedelta(days=2)).isoformat() # Default: 5 days ago because Mixpanel events export may have a lag of 5 days behind.
 START_DATE              = os.getenv('START_DATE', DEFAULT_START_DATE) # Date expected in ISO format YYYY-MM-DD
 
 ''' 
@@ -44,6 +49,33 @@ class mixpanelS3:
             region_name=aws_region,
             aws_access_key_id=aws_id,
             aws_secret_access_key=aws_secret)
+    
+    def normalizePropertyNames(self,name):
+        name=name.replace('$',"mp_")
+        for ch in [' ','\\','`','*','{','}','[',']','(',')','>','#','+','-','.','!','$','\'']:
+            name=name.replace(ch,"_")
+        return name.lower()
+    
+    def dataTransform(self,data):
+        # We unzip and decode the response
+        stringResponse = gzip.open(data).read().decode("utf-8")
+        # Convert every line to json and then normalize every column name to an Athena compatible one
+        self.logger.info('Normalizing data to be usable from Athena and Redshift')
+        normResponse = []
+        for line in stringResponse.split('\n'):
+            row = json.loads(line)
+            treat = dict()
+            treat['event'] = row['event']
+            treat['properties'] = dict()
+            for key in row['properties'].keys():
+                treat['properties'][self.normalizePropertyNames(key)] = row['properties'][key]
+            normResponse.append(json.dumps(treat, ensure_ascii=False))
+        self.logger.info('Encoding and compressing to a stream of bytes')
+        virtualFile = BytesIO()
+        compressed = gzip.GzipFile(fileobj=virtualFile, mode='wb')
+        compressed.write("\n".join(normResponse).encode('utf-8'))
+        compressed.close()
+        return virtualFile
     
     # See: https://mixpanel.com/help/reference/exporting-raw-data
     def exportEvents(self, from_date, to_date, event=None, where=None, stream=True):
@@ -79,8 +111,10 @@ class mixpanelS3:
 		)
         # resposne.raw from request module returns a file object you can read as new bytes are fetched from the network if stream=True
         with httpResponse.raw as data:
+            virtualFile = self.dataTransform(data)
+            virtualFile.seek(0)
             self.logger.info('Uploading multipart file to S3 bucket: {} key: {}'.format(bucket, key))
-            self.s3_client.upload_fileobj(data, bucket, key, Config=config)
+            self.s3_client.upload_fileobj(virtualFile, bucket, key, Config=config)
             self.logger.info('DONE Uploading multipart file to S3 bucket: {} key: {}'.format(bucket, key))
 
     def rawEventsToS3(self, from_date, to_date, bucket, key):
@@ -107,7 +141,7 @@ mixpanel = mixpanelS3(
     logger=log
 )
 start = datetime.date.fromisoformat(START_DATE)
-end   = datetime.date.today() - datetime.timedelta(days=5) # most recent end date is 5 days ago, since Mixpanel may take that long to make events available in API
+end   = datetime.date.today() - datetime.timedelta(days=1) # most recent end date is 1 days ago, since Mixpanel may take that long to make events available in API
 
 if end >= start: 
     for day in ( start + datetime.timedelta(days=n) for n in range( (end - start).days + 1 ) ):
